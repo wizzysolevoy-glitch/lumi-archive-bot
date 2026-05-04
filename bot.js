@@ -54,7 +54,6 @@ const stmts = {
   getUser: db.prepare('SELECT * FROM users WHERE user_id = ?'),
   createUser: db.prepare('INSERT OR IGNORE INTO users (user_id, username, first_name, requests) VALUES (?, ?, ?, ?)'),
   updateUser: db.prepare('UPDATE users SET username = ?, first_name = ? WHERE user_id = ?'),
-  addSearch: db.prepare('UPDATE users SET searches = searches + 1 WHERE user_id = ?'),
   useRequest: db.prepare('UPDATE users SET requests = requests - 1 WHERE user_id = ?'),
   addRequests: db.prepare('UPDATE users SET requests = requests + ? WHERE user_id = ?'),
   addHistory: db.prepare('INSERT INTO search_history (user_id, url, date, found) VALUES (?, ?, ?, ?)'),
@@ -147,6 +146,36 @@ async function searchArchive(url, timestamp) {
     clearTimeout(timeout);
     if (error.name === 'AbortError') return { found: false, error: 'timeout' };
     return { found: false, error: error.message };
+  }
+}
+
+// ========== CRYPTOBOT API ==========
+const CRYPTO_BOT_API = process.env.CRYPTO_BOT_TOKEN || '';
+
+async function createCryptoInvoice(amount, description) {
+  if (!CRYPTO_BOT_API) return null;
+  try {
+    const res = await fetch('https://pay.crypt.bot/api/createInvoice', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Crypto-Pay-API-Token': CRYPTO_BOT_API
+      },
+      body: JSON.stringify({
+        asset: 'USDT',
+        amount: amount.toString(),
+        description,
+        hidden_message: 'Спасибо за покупку премиума!',
+        payload: `premium_${Date.now()}`,
+        paid_btn_name: 'openBot',
+        paid_btn_url: `https://t.me/${botUsername}`
+      })
+    });
+    const data = await res.json();
+    return data.ok ? data.result : null;
+  } catch (e) {
+    console.error('CryptoBot error:', e);
+    return null;
   }
 }
 
@@ -294,17 +323,23 @@ bot.action('referral', (ctx) => {
   const userId = ctx.from.id;
   const refCount = stmts.getReferralCount.get(userId)?.count || 0;
   const link = `https://t.me/${botUsername}?start=ref_${userId}`;
+  const tgLink = `tg://resolve?domain=${botUsername}&start=ref_${userId}`;
   
   ctx.editMessageText(
     '👥 <b>Реферальная программа</b> 🕸️\n\n' +
-    `🔗 Твоя ссылка:\n<code>${link}</code>\n\n` +
     `🕷️ Приглашено: <b>${refCount}</b> чел.\n` +
     `🕸️ Бонус: <b>+5 запросов</b> за друга\n\n` +
     '💡 <b>Как пригласить:</b>\n' +
-    '1. Скопируй ссылку выше\n' +
-    '2. Отправь другу\n' +
+    '1. Нажми кнопку "Поделиться" ниже\n' +
+    '2. Или скопируй ссылку и отправь другу\n' +
     '3. Когда он запустит бота — получишь бонус!',
-    { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+    { 
+      parse_mode: 'HTML',
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.url('📤 Поделиться ссылкой', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('🕷️ Нашёл крутого бота для поиска старых версий сайтов! Попробуй — 3 бесплатных запроса при регистрации!')}`)],
+        [Markup.button.callback('🕸️ Главное меню', 'main_menu')]
+      ]).reply_markup
+    }
   );
 });
 
@@ -348,17 +383,80 @@ bot.action('help', (ctx) => {
   );
 });
 
-// Оплата
-bot.action('pay_week', (ctx) => {
-  ctx.editMessageText(
-    '💎 <b>Неделя — 2 USDT</b> 🕷️\n\n' +
-    'Для оплаты через @CryptoBot:\n\n' +
-    '1. Открой @CryptoBot\n' +
-    '2. Отправь 2 USDT на адрес админа\n' +
-    '3. Пришли скриншот сюда\n\n' +
-    '🕸️ Или напиши: @lumi_support',
-    { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
-  );
+// Оплата через CryptoBot
+bot.action('pay_week', async (ctx) => {
+  const invoice = await createCryptoInvoice(2, 'Lumi Archive — Премиум на неделю');
+  if (invoice) {
+    ctx.editMessageText(
+      '💎 <b>Неделя — 2 USDT</b> 🕷️\n\n' +
+      'Нажми кнопку ниже для оплаты через CryptoBot:\n\n' +
+      '🕸️ После оплаты премиум активируется автоматически',
+      { 
+        parse_mode: 'HTML',
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.url('💳 Оплатить 2 USDT', invoice.pay_url)],
+          [Markup.button.callback('🕸️ Назад', 'main_menu')]
+        ]).reply_markup
+      }
+    );
+  } else {
+    ctx.editMessageText(
+      '💎 <b>Неделя — 2 USDT</b> 🕷️\n\n' +
+      'Для оплаты напиши администратору:\n' +
+      '🕸️ @lumi_support',
+      { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
+    );
+  }
+});
+  
+bot.action('pay_month', async (ctx) => {
+  const invoice = await createCryptoInvoice(5, 'Lumi Archive — Премиум на месяц');
+  if (invoice) {
+    ctx.editMessageText(
+      '💎 <b>Месяц — 5 USDT</b> 🕷️\n\n' +
+      'Нажми кнопку ниже для оплаты через CryptoBot:\n\n' +
+      '🕸️ После оплаты премиум активируется автоматически',
+      { 
+        parse_mode: 'HTML',
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.url('💳 Оплатить 5 USDT', invoice.pay_url)],
+          [Markup.button.callback('🕸️ Назад', 'main_menu')]
+        ]).reply_markup
+      }
+    );
+  } else {
+    ctx.editMessageText(
+      '💎 <b>Месяц — 5 USDT</b> 🕷️\n\n' +
+      'Для оплаты напиши администратору:\n' +
+      '🕷️ @lumi_support',
+      { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
+    );
+  }
+});
+
+bot.action('pay_year', async (ctx) => {
+  const invoice = await createCryptoInvoice(15, 'Lumi Archive — Премиум на год');
+  if (invoice) {
+    ctx.editMessageText(
+      '💎 <b>Год — 15 USDT</b> 🕷️\n\n' +
+      'Нажми кнопку ниже для оплаты через CryptoBot:\n\n' +
+      '🕸️ После оплаты премиум активируется автоматически',
+      { 
+        parse_mode: 'HTML',
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.url('💳 Оплатить 15 USDT', invoice.pay_url)],
+          [Markup.button.callback('🕸️ Назад', 'main_menu')]
+        ]).reply_markup
+      }
+    );
+  } else {
+    ctx.editMessageText(
+      '💎 <b>Год — 15 USDT</b> 🕷️\n\n' +
+      'Для оплаты напиши администратору:\n' +
+      '🕸️ @lumi_support',
+      { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
+    );
+  }
 });
 
 bot.action('pay_month', (ctx) => {
