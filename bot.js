@@ -125,27 +125,38 @@ function parseUserDate(input) {
 // ========== ПОИСК В АРХИВЕ (собственная база) ==========
 async function searchArchive(url, timestamp) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000); // 15 секунд
+  const timeout = setTimeout(() => controller.abort(), 20000); // 20 сек
 
   try {
     const cleanUrl = url.replace(/^https?:\/\//, '');
     const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}&timestamp=${timestamp}`;
     
-    console.log(`[SEARCH] URL: ${cleanUrl}, timestamp: ${timestamp}`);
+    console.log(`[SEARCH] === START ===`);
+    console.log(`[SEARCH] URL: ${cleanUrl}`);
+    console.log(`[SEARCH] Timestamp: ${timestamp}`);
+    console.log(`[SEARCH] Full API: ${apiUrl}`);
     
     const response = await fetch(apiUrl, {
       signal: controller.signal,
-      headers: { 'User-Agent': 'Mozilla/5.0 (LumiArchive/2.0)' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
     });
     clearTimeout(timeout);
     
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    console.log(`[SEARCH] HTTP Status: ${response.status}`);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
     
     const data = await response.json();
-    console.log(`[SEARCH] Response:`, JSON.stringify(data).substring(0, 200));
+    console.log(`[SEARCH] Response JSON:`, JSON.stringify(data));
     
     if (data.archived_snapshots?.closest?.available) {
       const snap = data.archived_snapshots.closest;
+      console.log(`[SEARCH] ✅ FOUND: ${snap.url}`);
       return {
         found: true,
         url: snap.url.replace('http://', 'https://'),
@@ -153,12 +164,32 @@ async function searchArchive(url, timestamp) {
         status: snap.status
       };
     }
+    console.log(`[SEARCH] ❌ NOT FOUND`);
     return { found: false };
   } catch (error) {
     clearTimeout(timeout);
     console.error(`[SEARCH ERROR] ${error.name}: ${error.message}`);
+    console.error(`[SEARCH ERROR] Stack:`, error.stack);
     if (error.name === 'AbortError') return { found: false, error: 'timeout' };
     return { found: false, error: error.message };
+  }
+}
+
+// ========== ТЕСТ API ПРЯМО ИЗ БОТА ==========
+async function testArchiveAPI() {
+  try {
+    const testUrl = 'https://archive.org/wayback/available?url=example.com&timestamp=20200101';
+    console.log(`[TEST API] Calling: ${testUrl}`);
+    const res = await fetch(testUrl, { 
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(10000)
+    });
+    const data = await res.json();
+    console.log(`[TEST API] Status: ${res.status}, OK: ${res.ok}`);
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    console.error(`[TEST API] FAILED: ${e.message}`);
+    return { ok: false, error: e.message };
   }
 }
 
@@ -214,7 +245,8 @@ const keyboards = {
 
   admin: Markup.inlineKeyboard([
     [Markup.button.callback('📊 Статистика', 'admin_stats')],
-    [Markup.button.callback('👥 Пользователи', 'admin_users')],
+    [Markup.button.callback('👥 Пользователи', 'admin_users'), Markup.button.callback('🧪 Тест API', 'admin_testapi')],
+    [Markup.button.callback('📢 Рассылка', 'admin_broadcast'), Markup.button.callback('🗑️ Удалить юзера', 'admin_delete')],
     [Markup.button.callback('🎁 Выдать запросы', 'admin_give')],
     [Markup.button.callback('🕸️ Назад', 'main_menu')]
   ])
@@ -273,7 +305,8 @@ bot.start((ctx) => {
   );
 });
 
-bot.action('main_menu', (ctx) => {
+bot.action('main_menu', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const user = getOrCreateUser(ctx);
   ctx.editMessageText(
     '🕷️ <b>Lumi Archive</b> 🕸️\n\n' +
@@ -282,10 +315,11 @@ bot.action('main_menu', (ctx) => {
     `🕷️ Рефералов: <b>${user.referrals || 0}</b>\n\n` +
     'Выбери действие:',
     { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
-  );
+  ).catch(() => {});
 });
 
-bot.action('search_archive', (ctx) => {
+bot.action('search_archive', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   setState(ctx.from.id, { step: 'waiting_url' });
   ctx.editMessageText(
     '🕷️ <b>Поиск в архиве</b> 🕸️\n\n' +
@@ -293,7 +327,7 @@ bot.action('search_archive', (ctx) => {
     '<code>https://example.com</code>\n\n' +
     '<i>Или просто скопируй URL из браузера</i>',
     { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
-  );
+  ).catch(() => {});
 });
 
 bot.action('history', (ctx) => {
@@ -501,6 +535,45 @@ bot.on('text', async (ctx) => {
     }
   }
   
+  // Админ: рассылка всем
+  if (state?.action === 'admin_broadcast' && isAdmin(ctx)) {
+    clearState(userId);
+    const users = stmts.getAllUsers.all();
+    let sent = 0, failed = 0;
+    
+    for (const u of users) {
+      try {
+        await ctx.telegram.sendMessage(u.user_id, text, { parse_mode: 'HTML' });
+        sent++;
+      } catch (e) {
+        failed++;
+      }
+    }
+    
+    return ctx.reply(
+      `📢 <b>Рассылка завершена!</b> 🕸️\n\n` +
+      `✅ Отправлено: <b>${sent}</b>\n` +
+      `❌ Не удалось: <b>${failed}</b>`,
+      { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
+    );
+  }
+  
+  // Админ: удалить пользователя
+  if (state?.action === 'admin_delete' && isAdmin(ctx)) {
+    clearState(userId);
+    const targetId = parseInt(text);
+    if (!targetId) return ctx.reply('❌ Неверный ID');
+    
+    try {
+      db.prepare('DELETE FROM users WHERE user_id = ?').run(targetId);
+      db.prepare('DELETE FROM search_history WHERE user_id = ?').run(targetId);
+      db.prepare('DELETE FROM referrals WHERE referrer_id = ? OR referred_id = ?').run(targetId, targetId);
+      return ctx.reply(`🗑️ Пользователь <b>${targetId}</b> удалён`, { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup });
+    } catch (e) {
+      return ctx.reply('❌ Ошибка удаления: ' + e.message);
+    }
+  }
+  
   // Админ: выдать запросы
   if (state?.action === 'admin_give' && isAdmin(ctx)) {
     clearState(userId);
@@ -703,7 +776,49 @@ bot.action('admin_give', async (ctx) => {
   }
 });
 
-// ========== ЗАЩИТА ОТ ПАДЕНИЙ ==========
+bot.action('admin_testapi', async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery('⛔️ Доступ запрещён').catch(() => {});
+  }
+  await ctx.answerCbQuery('🧪 Тестируем API...').catch(() => {});
+  
+  const result = await testArchiveAPI();
+  
+  const text = '🧪 <b>Тест API Archive.org</b> 🕸️\n\n' +
+    `✅ HTTP: <b>${result.status || 'ERR'}</b>\n` +
+    `📦 Ответ: <code>${JSON.stringify(result.data || result.error).substring(0, 300)}</code>\n\n` +
+    (result.ok ? '✅ API работает!' : '❌ API не отвечает');
+  
+  ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }).catch(() => {});
+});
+
+bot.action('admin_broadcast', async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery('⛔️ Доступ запрещён').catch(() => {});
+  }
+  await ctx.answerCbQuery('📢 Режим рассылки').catch(() => {});
+  setState(ctx.from.id, { action: 'admin_broadcast' });
+  ctx.editMessageText(
+    '📢 <b>Рассылка всем пользователям</b> 🕸️\n\n' +
+    'Отправь текст для рассылки:\n' +
+    '<i>Поддерживается HTML-разметка</i>',
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+});
+
+bot.action('admin_delete', async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery('⛔️ Доступ запрещён').catch(() => {});
+  }
+  await ctx.answerCbQuery('🗑️ Режим удаления').catch(() => {});
+  setState(ctx.from.id, { action: 'admin_delete' });
+  ctx.editMessageText(
+    '🗑️ <b>Удалить пользователя</b> 🕸️\n\n' +
+    'Отправь ID пользователя для удаления:\n' +
+    '<code>123456789</code>',
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+});
 bot.catch((err, ctx) => {
   console.error(`[ERROR] ${ctx.updateType}:`, err.message);
   try {
