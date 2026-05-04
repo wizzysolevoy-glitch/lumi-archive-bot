@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.db
+*.log
+.DS_Store
+tg-ws-proxy/venv/
+__pycache__/
+*.pyc
+database/
+logs/
