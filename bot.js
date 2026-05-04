@@ -12,6 +12,12 @@ const ADMIN_ID = 8660224775;
 // ========== БАЗА ДАННЫХ ==========
 const db = new Database('lumi_archive.db');
 
+// Миграция: добавляем недостающие колонки
+try { db.exec('ALTER TABLE users ADD COLUMN searches INTEGER DEFAULT 0'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN referrals INTEGER DEFAULT 0'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN premium_expires DATETIME'); } catch (e) {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
