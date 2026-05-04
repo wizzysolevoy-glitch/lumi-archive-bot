@@ -152,7 +152,10 @@ async function searchArchive(url, timestamp) {
     }
     
     const data = await response.json();
-    console.log(`[SEARCH] Response JSON:`, JSON.stringify(data));
+    console.log(`[SEARCH] FULL Response:`, JSON.stringify(data, null, 2));
+    
+    // ДЕБАГ: показываем пользователю что API вернул
+    const debugInfo = `🧪 <b>Debug API:</b>\nStatus: ${response.status}\nURL: ${cleanUrl}\nTS: ${timestamp}\nSnapshots: ${JSON.stringify(data.archived_snapshots || {}).substring(0, 200)}`;
     
     if (data.archived_snapshots?.closest?.available) {
       const snap = data.archived_snapshots.closest;
@@ -161,11 +164,12 @@ async function searchArchive(url, timestamp) {
         found: true,
         url: snap.url.replace('http://', 'https://'),
         timestamp: snap.timestamp,
-        status: snap.status
+        status: snap.status,
+        debug: debugInfo
       };
     }
-    console.log(`[SEARCH] ❌ NOT FOUND`);
-    return { found: false };
+    console.log(`[SEARCH] ❌ NOT FOUND — archived_snapshots empty`);
+    return { found: false, debug: debugInfo, raw: JSON.stringify(data).substring(0, 400) };
   } catch (error) {
     clearTimeout(timeout);
     console.error(`[SEARCH ERROR] ${error.name}: ${error.message}`);
@@ -675,7 +679,7 @@ bot.on('text', async (ctx) => {
         `🕸️ <b>Статус:</b> ${result.status === '200' ? '✅ Сохранён' : '⚠️ ' + result.status}\n\n` +
         `👇 <b>Открыть архив:</b>\n` +
         `<a href="${result.url}">🕷️ Смотреть историческую версию</a>\n\n` +
-        '<i>Нажми на ссылку выше!</i>',
+        `<i>${result.debug || ''}</i>`,
         { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup, disable_web_page_preview: true }
       );
     } else {
@@ -692,6 +696,8 @@ bot.on('text', async (ctx) => {
         `🔗 Ссылка: <a href="${url}">${escapeHtml(url)}</a>\n` +
         `📅 Дата: ${parsed.display}\n\n` +
         reason + '\n\n' +
+        `🧪 <b>Debug:</b>\n<code>${result.debug || 'no debug'}</code>\n\n` +
+        `🧪 <b>Raw:</b>\n<code>${result.raw || 'no raw'}</code>\n\n` +
         '💡 Попробуй другую дату или сайт!',
         { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
       );
