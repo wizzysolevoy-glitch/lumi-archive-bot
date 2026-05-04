@@ -1,0 +1,25 @@
+{
+  "name": "lumi_archive",
+  "version": "1.0.0",
+  "description": "Telegram bot for web archive - lumi_archive",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "pm2:start": "pm2 start bot.js --name lumi-archive",
+    "pm2:stop": "pm2 stop lumi-archive",
+    "pm2:restart": "pm2 restart lumi-archive",
+    "pm2:logs": "pm2 logs lumi-archive"
+  },
+  "keywords": ["telegram", "bot", "archive", "web"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "dotenv": "^16.4.5",
+    "better-sqlite3": "^9.4.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
