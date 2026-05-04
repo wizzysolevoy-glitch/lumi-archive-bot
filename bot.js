@@ -22,6 +22,12 @@ try { db.exec('ALTER TABLE users ADD COLUMN referrals INTEGER DEFAULT 0'); } cat
 try { db.exec('ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0'); } catch (e) {}
 try { db.exec('ALTER TABLE users ADD COLUMN premium_expires DATETIME'); } catch (e) {}
 
+// ФИКС: заполняем NULL значения для старых пользователей
+try { db.exec('UPDATE users SET requests = 3 WHERE requests IS NULL'); } catch (e) {}
+try { db.exec('UPDATE users SET searches = 0 WHERE searches IS NULL'); } catch (e) {}
+try { db.exec('UPDATE users SET referrals = 0 WHERE referrals IS NULL'); } catch (e) {}
+try { db.exec('UPDATE users SET is_premium = 0 WHERE is_premium IS NULL'); } catch (e) {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -192,7 +198,7 @@ const keyboards = {
     [Markup.button.callback('🕷️ Найти в архиве', 'search_archive')],
     [Markup.button.callback('🕸️ История', 'history'), Markup.button.callback('💰 Баланс', 'balance')],
     [Markup.button.callback('👥 Рефералка', 'referral'), Markup.button.callback('💎 Премиум', 'premium')],
-    [Markup.button.callback('🕷️ Как это работает', 'help')]
+    [Markup.button.callback('🕷️ Как это работает', 'help'), Markup.button.callback('🔐 Админ', 'admin_login')]
   ]),
 
   back: Markup.inlineKeyboard([
@@ -464,6 +470,163 @@ bot.action('pay_year', async (ctx) => {
       { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
     );
   }
+});
+
+bot.action('admin_login', (ctx) => {
+  setState(ctx.from.id, { action: 'admin_password' });
+  ctx.editMessageText(
+    '🔐 <b>Админ-панель</b> 🕸️\n\n' +
+    'Введите пароль:',
+    { parse_mode: 'HTML' }
+  );
+});
+
+// Обработка текста
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  const text = ctx.text.trim();
+  
+  // Админ: ввод пароля
+  if (state?.action === 'admin_password') {
+    clearState(userId);
+    if (text === '8660224775') {
+      return ctx.reply(
+        '🔓 <b>Доступ разрешён!</b> 🕸️\n\n' +
+        'Выбери действие:',
+        { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
+      );
+    } else {
+      return ctx.reply('🕸️ ⛔️ Неверный пароль 🕷️', { reply_markup: keyboards.main.reply_markup });
+    }
+  }
+  
+  // Админ: выдать запросы
+  if (state?.action === 'admin_give' && isAdmin(ctx)) {
+    clearState(userId);
+    const parts = text.split(/\s+/);
+    if (parts.length !== 2) {
+      return ctx.reply('❌ Формат: <code>ID КОЛИЧЕСТВО</code>', { parse_mode: 'HTML' });
+    }
+    const targetId = parseInt(parts[0]);
+    const amount = parseInt(parts[1]);
+    if (!targetId || !amount) return ctx.reply('❌ Неверные числа');
+    
+    const target = stmts.getUser.get(targetId);
+    if (!target) return ctx.reply('❌ Пользователь не найден');
+    
+    stmts.addRequests.run(amount, targetId);
+    ctx.reply(`✅ Выдано <b>${amount}</b> запросов`, { parse_mode: 'HTML' });
+    ctx.telegram.sendMessage(targetId, `🕸️ <b>Бонус!</b>\n\nТебе начислено <b>${amount}</b> запросов!`, { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+  
+  if (!state) {
+    return ctx.reply('🕷️ Используй кнопки ниже 👇', { reply_markup: keyboards.main.reply_markup });
+  }
+  
+  if (state.step === 'waiting_url') {
+    let url = text;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'https://' + url;
+    }
+    
+    if (!isValidUrl(url)) {
+      return ctx.reply(
+        '❌ <b>Некорректная ссылка</b>\n\n' +
+        'Отправь valid URL:\n<code>https://example.com</code>',
+        { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
+      );
+    }
+    
+    setState(userId, { step: 'waiting_date', url });
+    
+    return ctx.reply(
+      '🕷️ <b>Ссылка принята!</b> 🕸️\n\n' +
+      '📅 <b>Какую дату ищем?</b>\n\n' +
+      'Отправь дату в любом формате:\n\n' +
+      '<code>2020</code> — любой день 2020\n' +
+      '<code>2020-06</code> — июнь 2020\n' +
+      '<code>2020-06-15</code> — конкретный день\n' +
+      '<code>15.06.2020</code> — тоже ок',
+      { parse_mode: 'HTML' }
+    );
+  }
+  
+  if (state.step === 'waiting_date') {
+    clearState(userId);
+    
+    const parsed = parseUserDate(text);
+    if (!parsed.valid) {
+      return ctx.reply(
+        '❌ <b>Непонятная дата</b>\n\n' +
+        'Используй формат:\n' +
+        '<code>2020</code>, <code>2020-06</code>, <code>15.06.2020</code>\n\n' +
+        'Попробуй ещё раз:',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    const url = state.url;
+    const user = getOrCreateUser(ctx);
+    const requestsLeft = user.requests || 0;
+    
+    if (requestsLeft <= 0 && !user.is_premium) {
+      return ctx.reply(
+        '❌ <b>Запросы закончились!</b> 🕸️\n\n' +
+        '💎 Купи премиум или пригласи друга:\n' +
+        '🕷️ Неделя — 2 USDT\n' +
+        '🕸️ Месяц — 5 USDT\n' +
+        '🕷️ Год — 15 USDT\n\n' +
+        '👥 Рефералка: +5 запросов за друга',
+        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+      );
+    }
+    
+    await ctx.replyWithChatAction('typing');
+    
+    const result = await searchArchive(url, parsed.ts);
+    
+    if (!user.is_premium) {
+      stmts.useRequest.run(userId);
+    }
+    stmts.addHistory.run(userId, url, parsed.display, result.found ? 1 : 0);
+    
+    if (result.found) {
+      const archiveDate = result.timestamp.substring(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+      
+      ctx.reply(
+        '🕷️ <b>Архив найден!</b> 🕸️\n\n' +
+        `🔗 <b>Оригинал:</b> <a href="${url}">${escapeHtml(url)}</a>\n` +
+        `📅 <b>Дата архива:</b> ${archiveDate}\n` +
+        `🕸️ <b>Статус:</b> ${result.status === '200' ? '✅ Сохранён' : '⚠️ ' + result.status}\n\n` +
+        `👇 <b>Открыть архив:</b>\n` +
+        `<a href="${result.url}">🕷️ Смотреть историческую версию</a>\n\n` +
+        '<i>Нажми на ссылку выше!</i>',
+        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup, disable_web_page_preview: true }
+      );
+    } else {
+      const reason = result.error === 'timeout' 
+        ? '⏱️ Запрос занял слишком много времени. Попробуй ещё раз или выбери другую дату.'
+        : '😕 Страница не найдена в нашем архиве.\n\n' +
+          'Возможно:\n' +
+          '• Сайт никогда не архивировался\n' +
+          '• Дата слишком ранняя\n' +
+          '• Сайт заблокирован от сохранения';
+      
+      ctx.reply(
+        '🕸️ <b>Архив не найден</b> 🕷️\n\n' +
+        `🔗 Ссылка: <a href="${url}">${escapeHtml(url)}</a>\n` +
+        `📅 Дата: ${parsed.display}\n\n` +
+        reason + '\n\n' +
+        '💡 Попробуй другую дату или сайт!',
+        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+      );
+    }
+    return;
+  }
+  
+  ctx.reply('🕷️ Используй кнопки ниже 👇', { reply_markup: keyboards.main.reply_markup });
 });
 
 // ========== АДМИН-ПАНЕЛЬ ==========
