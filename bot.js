@@ -184,10 +184,13 @@ async function testArchiveAPI() {
   try {
     const testUrl = 'https://archive.org/wayback/available?url=example.com&timestamp=20200101';
     console.log(`[TEST API] Calling: ${testUrl}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
     const res = await fetch(testUrl, { 
       headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(10000)
+      signal: controller.signal
     });
+    clearTimeout(timeout);
     const data = await res.json();
     console.log(`[TEST API] Status: ${res.status}, OK: ${res.ok}`);
     return { ok: res.ok, status: res.status, data };
@@ -835,20 +838,29 @@ bot.catch((err, ctx) => {
 // ========== ЗАПУСК ==========
 async function startBot() {
   try {
+    console.log('[START] Getting bot info...');
     const me = await bot.telegram.getMe();
     botUsername = me.username;
     console.log('🕷️ Lumi Archive Bot запущен!');
     console.log('🕸️ @' + botUsername);
     console.log('🔐 Админ ID:', ADMIN_ID);
+    
+    console.log('[START] Testing API...');
+    const test = await testArchiveAPI();
+    console.log('[START] API test:', test.ok ? 'OK' : 'FAILED');
   } catch (e) {
-    console.error('❌ Не удалось получить info бота:', e.message);
-    console.log('🕷️ Lumi Archive Bot запущен!');
+    console.error('❌ [START ERROR]:', e.message);
+    console.log('🕷️ Lumi Archive Bot запущен (fallback)!');
     console.log('🕸️ @' + botUsername);
   }
 }
 
-bot.launch({ dropPendingUpdates: true });
-startBot();
+try {
+  bot.launch({ dropPendingUpdates: true });
+  startBot();
+} catch (e) {
+  console.error('❌ [FATAL]:', e.message);
+}
 
 process.once('SIGINT', () => {
   bot.stop('SIGINT');
