@@ -1,21 +1,15 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
-const Database = require('better-sqlite3');
-const fs = require('fs');
-const path = require('path');
 
 // ========== НАСТРОЙКИ ==========
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const bot = new Telegraf(process.env.BOT_TOKEN, {
+  telegram: { webhookReply: false } // Отключаем webhook для polling
+});
 const botUsername = process.env.BOT_USERNAME || 'lumi_archive';
 const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null;
 
-// Папка для архивов
-const ARCHIVES_DIR = path.join(__dirname, 'archives');
-if (!fs.existsSync(ARCHIVES_DIR)) {
-  fs.mkdirSync(ARCHIVES_DIR, { recursive: true });
-}
-
 // ========== БАЗА ДАННЫХ ==========
+const Database = require('better-sqlite3');
 const db = new Database('lumi_archive.db');
 
 db.exec(`
@@ -23,50 +17,28 @@ db.exec(`
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     first_name TEXT,
-    requests INTEGER DEFAULT 2,
-    referrals INTEGER DEFAULT 0,
-    subscription_type TEXT DEFAULT 'free',
-    subscription_expires DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_active DATETIME DEFAULT CURRENT_TIMESTAMP
+    searches INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
-  CREATE TABLE IF NOT EXISTS archives (
+  CREATE TABLE IF NOT EXISTS search_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
     url TEXT,
-    title TEXT,
-    file_path TEXT,
-    file_size INTEGER,
-    saved_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS referrals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    referrer_id INTEGER,
-    referred_id INTEGER UNIQUE,
-    rewarded INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    date TEXT,
+    found INTEGER,
+    searched_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
 // ========== STATEMENTS ==========
 const stmts = {
   getUser: db.prepare('SELECT * FROM users WHERE user_id = ?'),
-  createUser: db.prepare('INSERT OR IGNORE INTO users (user_id, username, first_name, requests) VALUES (?, ?, ?, ?)'),
-  updateUser: db.prepare('UPDATE users SET username = ?, first_name = ?, last_active = CURRENT_TIMESTAMP WHERE user_id = ?'),
-  getArchives: db.prepare('SELECT * FROM archives WHERE user_id = ? ORDER BY saved_at DESC LIMIT 20'),
-  addArchive: db.prepare('INSERT INTO archives (user_id, url, title, file_path, file_size) VALUES (?, ?, ?, ?, ?)'),
-  addReferral: db.prepare('INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)'),
-  rewardReferral: db.prepare('UPDATE referrals SET rewarded = 1 WHERE referrer_id = ? AND referred_id = ?'),
-  getReferralCount: db.prepare('SELECT COUNT(*) as count FROM referrals WHERE referrer_id = ? AND rewarded = 1'),
-  addRequests: db.prepare('UPDATE users SET requests = requests + ? WHERE user_id = ?'),
-  useRequest: db.prepare('UPDATE users SET requests = requests - 1 WHERE user_id = ?'),
-  getStats: db.prepare('SELECT COUNT(*) as total_users, SUM(requests) as total_requests FROM users'),
-  getTotalArchives: db.prepare('SELECT COUNT(*) as count FROM archives'),
-  getTodayArchives: db.prepare("SELECT COUNT(*) as count FROM archives WHERE DATE(saved_at) = DATE('now')"),
-  getAllUsers: db.prepare('SELECT user_id, username, first_name, requests, subscription_type, created_at FROM users ORDER BY created_at DESC'),
-  updateSubscription: db.prepare('UPDATE users SET subscription_type = ?, subscription_expires = ?, requests = requests + ? WHERE user_id = ?')
+  createUser: db.prepare('INSERT OR IGNORE INTO users (user_id, username, first_name, searches) VALUES (?, ?, ?, ?)'),
+  updateUser: db.prepare('UPDATE users SET username = ?, first_name = ?, searches = searches + 1 WHERE user_id = ?'),
+  addHistory: db.prepare('INSERT INTO search_history (user_id, url, date, found) VALUES (?, ?, ?, ?)'),
+  getHistory: db.prepare('SELECT * FROM search_history WHERE user_id = ? ORDER BY searched_at DESC LIMIT 10'),
+  getStats: db.prepare('SELECT COUNT(*) as total_users, SUM(searches) as total_searches FROM users')
 };
 
 // ========== СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ ==========
@@ -90,97 +62,110 @@ function getOrCreateUser(ctx) {
   const username = ctx.from.username || null;
   const firstName = ctx.from.first_name || 'Пользователь';
   
-  stmts.createUser.run(userId, username, firstName, 2);
+  stmts.createUser.run(userId, username, firstName, 0);
   stmts.updateUser.run(username, firstName, userId);
   
   return stmts.getUser.get(userId);
 }
 
-function isAdmin(ctx) {
-  return ADMIN_ID && ctx.from.id === ADMIN_ID;
-}
-
 function formatDate(dateStr) {
   if (!dateStr) return '—';
   const d = new Date(dateStr);
-  return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+
+function parseUserDate(input) {
+  // Парсим дату из разных форматов: 2020, 2020-01, 2020-01-01, 01.01.2020, 01/01/2020
+  const patterns = [
+    /^(\d{4})-(\d{2})-(\d{2})$/,  // 2020-01-15
+    /^(\d{4})-(\d{2})$/,          // 2020-01
+    /^(\d{4})$/,                  // 2020
+    /^(\d{2})\.(\d{2})\.(\d{4})$/, // 15.01.2020
+    /^(\d{2})\/(\d{2})\/(\d{4})$/  // 15/01/2020
+  ];
+  
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+    if (match) {
+      if (pattern === patterns[0]) {
+        return { valid: true, timestamp: `${match[1]}${match[2]}${match[3]}`, display: input };
+      } else if (pattern === patterns[1]) {
+        return { valid: true, timestamp: `${match[1]}${match[2]}01`, display: input };
+      } else if (pattern === patterns[2]) {
+        return { valid: true, timestamp: `${match[1]}0101`, display: input };
+      } else if (pattern === patterns[3] || pattern === patterns[4]) {
+        return { valid: true, timestamp: `${match[3]}${match[2]}${match[1]}`, display: input };
+      }
+    }
+  }
+  return { valid: false };
 }
 
 function escapeHtml(text) {
   if (!text) return '';
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function isValidUrl(url) {
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ========== КЛАВИАТУРЫ ==========
 const keyboards = {
   main: Markup.inlineKeyboard([
-    [Markup.button.callback('💾 Сохранить страницу', 'save_url')],
-    [Markup.button.callback('📜 Мои архивы', 'history'), Markup.button.callback('💰 Баланс', 'balance')],
-    [Markup.button.callback('👥 Рефералка', 'referral'), Markup.button.callback('📊 Тарифы', 'tariffs')]
-  ]),
-
-  save: Markup.inlineKeyboard([
-    [Markup.button.callback('🔗 Вставить ссылку', 'input_url')],
-    [Markup.button.callback('🔙 Назад', 'main_menu')]
-  ]),
-
-  tariffs: Markup.inlineKeyboard([
-    [Markup.button.callback('📅 Неделя — 100₽', 'tariff_week')],
-    [Markup.button.callback('📆 Месяц — 300₽', 'tariff_month')],
-    [Markup.button.callback('📀 Год — 1000₽', 'tariff_year')],
-    [Markup.button.callback('🔙 Назад', 'main_menu')]
+    [Markup.button.callback('🔍 Найти в архиве', 'search_archive')],
+    [Markup.button.callback('📜 История поиска', 'history'), Markup.button.callback('👤 Профиль', 'profile')],
+    [Markup.button.callback('ℹ️ Как это работает', 'help')]
   ]),
 
   back: Markup.inlineKeyboard([
-    [Markup.button.callback('🔙 Назад', 'main_menu')]
+    [Markup.button.callback('🔙 Главное меню', 'main_menu')]
   ]),
 
-  admin: Markup.inlineKeyboard([
-    [Markup.button.callback('📊 Статистика', 'admin_stats')],
-    [Markup.button.callback('👥 Список пользователей', 'admin_users')],
-    [Markup.button.callback('🎁 Выдать запросы', 'admin_give')],
-    [Markup.button.callback('🔙 Главное меню', 'main_menu')]
+  search: Markup.inlineKeyboard([
+    [Markup.button.callback('📅 Сегодня', 'date_today')],
+    [Markup.button.callback('📅 Год назад', 'date_year_ago')]
   ])
 };
 
-// ========== АРХИВАЦИЯ ==========
-async function archivePage(url, userId) {
+// ========== WAYBACK MACHINE API ==========
+async function searchArchive(url, timestamp) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    // Очищаем URL от протокола
+    const cleanUrl = url.replace(/^https?:\/\//, '');
     
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+    // API Wayback Machine
+    const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}&timestamp=${timestamp}`;
+    
+    const response = await fetch(apiUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
     });
-    clearTimeout(timeout);
     
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
     
-    const html = await response.text();
-    const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
-    const title = titleMatch ? titleMatch[1].trim() : url;
+    const data = await response.json();
     
-    // Сохраняем файл
-    const timestamp = Date.now();
-    const filename = `${userId}_${timestamp}.html`;
-    const filePath = path.join(ARCHIVES_DIR, filename);
+    if (data.archived_snapshots && data.archived_snapshots.closest && data.archived_snapshots.closest.available) {
+      const snapshot = data.archived_snapshots.closest;
+      return {
+        found: true,
+        url: snapshot.url.replace('http://', 'https://'),
+        timestamp: snapshot.timestamp,
+        status: snapshot.status
+      };
+    }
     
-    fs.writeFileSync(filePath, html, 'utf-8');
-    const fileSize = Buffer.byteLength(html, 'utf-8');
-    
-    return { success: true, title, filePath, fileSize };
+    return { found: false };
   } catch (error) {
-    console.error('Archive error:', error.message);
-    return { success: false, error: error.message };
+    console.error('Archive API error:', error.message);
+    return { found: false, error: error.message };
   }
 }
 
@@ -188,53 +173,18 @@ async function archivePage(url, userId) {
 
 // /start
 bot.start((ctx) => {
-  const userId = ctx.from.id;
-  const payload = ctx.startPayload;
-  
-  // Реферальная система
-  if (payload && payload.startsWith('ref_')) {
-    const referrerId = parseInt(payload.split('ref_')[1]);
-    
-    if (referrerId && referrerId !== userId) {
-      const referrer = stmts.getUser.get(referrerId);
-      
-      if (referrer) {
-        const existing = db.prepare('SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?').get(referrerId, userId);
-        
-        if (!existing) {
-          stmts.addReferral.run(referrerId, userId);
-          stmts.rewardReferral.run(referrerId, userId);
-          stmts.addRequests.run(4, referrerId);
-          
-          ctx.reply(
-            '🎉 <b>Ты пришёл по реферальной ссылке!</b>\n\n' +
-            '✅ Тебе начислено <b>2 бесплатных запроса</b>\n' +
-            '✅ Твой друг получил <b>+4 запроса</b>',
-            { parse_mode: 'HTML' }
-          );
-          
-          // Уведомление рефереру
-          ctx.telegram.sendMessage(
-            referrerId,
-            `🎁 <b>Новый реферал!</b>\n\n` +
-            `Пользователь <b>${escapeHtml(ctx.from.first_name)}</b> присоединился!\n` +
-            `🔹 +4 запроса начислено`,
-            { parse_mode: 'HTML' }
-          ).catch(() => {});
-        }
-      }
-    }
-  }
-  
   getOrCreateUser(ctx);
   
   ctx.reply(
-    '🤖 <b>Lumi Archive</b>\n\n' +
-    '💾 Сохраняй веб-страницы в архив!\n\n' +
-    '🔹 <b>2 бесплатных запроса</b> при регистрации\n' +
-    '🔹 <b>+4 запроса</b> за каждого друга\n' +
-    '🔹 Подписки от <b>100₽</b>\n\n' +
-    'Выбери действие:',
+    '🕰️ <b>Lumi Archive</b>\n\n' +
+    '<i>Машина времени для интернета</i>\n\n' +
+    '🔍 <b>Что я умею:</b>\n' +
+    '• Находить старые версии сайтов\n' +
+    '• Показывать, как страница выглядела раньше\n' +
+    '• Работать с Wayback Machine\n\n' +
+    '<b>Пример:</b>\n' +
+    'Введи ссылку и дату — я найду, как сайт выглядел в тот день!\n\n' +
+    '👇 Выбери действие:',
     { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
   );
 });
@@ -244,314 +194,266 @@ bot.action('main_menu', (ctx) => {
   const user = getOrCreateUser(ctx);
   
   ctx.editMessageText(
-    '🤖 <b>Lumi Archive</b>\n\n' +
-    `💾 Сохраняй веб-страницы в архив!\n\n` +
-    `🔹 Баланс: <b>${user.requests}</b> запросов\n` +
-    `🔹 Тариф: <b>${user.subscription_type || 'free'}</b>\n\n` +
+    '🕰️ <b>Lumi Archive</b>\n\n' +
+    '<i>Машина времени для интернета</i>\n\n' +
+    `🔹 Поисков: <b>${user.searches}</b>\n\n` +
     'Выбери действие:',
     { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
   );
 });
 
-// Сохранить URL
-bot.action('save_url', (ctx) => {
-  ctx.editMessageText(
-    '💾 <b>Сохранить страницу</b>\n\n' +
-    'Я скачаю страницу, извлеку заголовок и сохраню HTML в архив.\n\n' +
-    'Нажми кнопку ниже, чтобы вставить ссылку:',
-    { parse_mode: 'HTML', reply_markup: keyboards.save.reply_markup }
-  );
-});
-
-// Ожидание URL
-bot.action('input_url', (ctx) => {
+// Поиск в архиве
+bot.action('search_archive', (ctx) => {
   const userId = ctx.from.id;
-  setState(userId, { action: 'waiting_url' });
+  setState(userId, { step: 'waiting_url' });
   
   ctx.editMessageText(
-    '📝 <b>Отправь ссылку</b>\n\n' +
-    'Пример: <code>https://example.com</code>\n\n' +
-    '❗️ Бот скачает страницу и сохранит HTML',
-    { parse_mode: 'HTML' }
+    '🔍 <b>Поиск в архиве</b>\n\n' +
+    'Отправь мне ссылку на сайт:\n\n' +
+    '<code>https://example.com</code>\n\n' +
+    '<i>Или просто скопируй URL из браузера</i>',
+    { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
   );
 });
 
 // История
 bot.action('history', (ctx) => {
   const userId = ctx.from.id;
-  const archives = stmts.getArchives.all(userId);
+  const history = stmts.getHistory.all(userId);
   
-  if (archives.length === 0) {
+  if (history.length === 0) {
     return ctx.editMessageText(
-      '📜 <b>Мои архивы</b>\n\n' +
-      'Пока пусто... Сохрани свою первую страницу!',
+      '📜 <b>История поиска</b>\n\n' +
+      'Пока пусто... Сделай первый поиск!',
       { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
     );
   }
   
-  let text = '📜 <b>Мои архивы</b>\n\n';
-  archives.forEach((archive, index) => {
-    const date = formatDate(archive.saved_at);
-    const title = escapeHtml(archive.title || archive.url);
-    const size = archive.file_size ? `(${Math.round(archive.file_size / 1024)} KB)` : '';
-    text += `${index + 1}. <a href="${archive.url}">${title}</a> ${size}\n`;
-    text += `   📅 ${date}\n\n`;
+  let text = '📜 <b>История поиска</b>\n\n';
+  history.forEach((item, i) => {
+    const icon = item.found ? '✅' : '❌';
+    const date = formatDate(item.searched_at);
+    text += `${icon} <a href="${item.url}">${escapeHtml(item.url.substring(0, 40))}${item.url.length > 40 ? '...' : ''}</a>\n`;
+    text += `   📅 Дата: ${item.date} | Найден: ${item.found ? 'Да' : 'Нет'}\n`;
+    text += `   🕐 ${date}\n\n`;
   });
   
   ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup });
 });
 
-// Баланс
-bot.action('balance', (ctx) => {
+// Профиль
+bot.action('profile', (ctx) => {
   const user = getOrCreateUser(ctx);
-  const refCount = stmts.getReferralCount.get(user.id)?.count || 0;
-  
-  let subText = '';
-  if (user.subscription_expires) {
-    subText = `\n📅 Подписка до: <b>${formatDate(user.subscription_expires)}</b>\n`;
-  }
+  const history = stmts.getHistory.all(user.id);
+  const foundCount = history.filter(h => h.found).length;
   
   ctx.editMessageText(
-    '💰 <b>Мой баланс</b>\n\n' +
-    `🔹 Запросов: <b>${user.requests}</b>\n` +
-    `🔹 Рефералов: <b>${refCount}</b>\n` +
-    `🔹 Тариф: <b>${user.subscription_type || 'free'}</b>` +
-    subText + '\n' +
-    '👥 Пригласи друга и получи <b>+4 запроса</b>!',
+    '👤 <b>Твой профиль</b>\n\n' +
+    `🔹 Поисков всего: <b>${user.searches}</b>\n` +
+    `🔹 Найдено архивов: <b>${foundCount}</b>\n` +
+    `🔹 В базе с: <b>${formatDate(user.created_at)}</b>\n\n` +
+    '🎯 Используй бота чаще — помогаю находить утраченный контент!',
     { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
   );
 });
 
-// Рефералка
-bot.action('referral', (ctx) => {
-  const userId = ctx.from.id;
-  const refCount = stmts.getReferralCount.get(userId)?.count || 0;
-  const link = `https://t.me/${botUsername}?start=ref_${userId}`;
-  
+// Помощь
+bot.action('help', (ctx) => {
   ctx.editMessageText(
-    '👥 <b>Реферальная программа</b>\n\n' +
-    `🔗 Твоя ссылка:\n<code>${link}</code>\n\n` +
-    `🔹 Приглашено: <b>${refCount}</b> чел.\n` +
-    `🔹 Бонус: <b>+4 запроса</b> за друга\n\n` +
-    '💡 <b>Как пригласить:</b>\n' +
-    '1. Скопируй ссылку выше\n' +
-    '2. Отправь другу\n' +
-    '3. Когда он запустит бота — получишь бонус!',
-    { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+    'ℹ️ <b>Как это работает</b>\n\n' +
+    '🕰️ <b>Lumi Archive</b> использует <b>Wayback Machine</b> — largest archive of web pages.\n\n' +
+    '<b>Как искать:</b>\n' +
+    '1. Нажми "🔍 Найти в архиве"\n' +
+    '2. Отправь ссылку на сайт\n' +
+    '3. Отправь дату (год, месяц или день)\n' +
+    '4. Получи ссылку на архивную версию!\n\n' +
+    '<b>Форматы даты:</b>\n' +
+    '• <code>2020</code> — любой день 2020 года\n' +
+    '• <code>2020-06</code> — июнь 2020\n' +
+    '• <code>2020-06-15</code> — конкретный день\n' +
+    '• <code>15.06.2020</code> — тоже работает\n\n' +
+    '<b>Примеры:</b>\n' +
+    '• Как выглядел VK в 2010?\n' +
+    '• Какой был YouTube в 2007?\n' +
+    '• Что было на сайте до редизайна?\n\n' +
+    '🔙 Нажми "Назад" чтобы начать!',
+    { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
   );
 });
 
-// Тарифы
-bot.action('tariffs', (ctx) => {
-  ctx.editMessageText(
-    '📊 <b>Тарифы</b>\n\n' +
-    '<b>📅 Неделя — 100₽</b>\n' +
-    '✅ 50 запросов\n\n' +
-    '<b>📆 Месяц — 300₽</b>\n' +
-    '✅ 200 запросов\n' +
-    '✅ Приоритетная поддержка\n\n' +
-    '<b>📀 Год — 1000₽</b>\n' +
-    '✅ 1000 запросов\n' +
-    '✅ Приоритетная поддержка\n' +
-    '✅ Ранний доступ к фичам\n\n' +
-    '💳 Для покупки напиши: @lumi_support',
-    { parse_mode: 'HTML', reply_markup: keyboards.tariffs.reply_markup }
-  );
-});
-
-// Обработка текстовых сообщений (URL)
+// Обработка текста
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const state = getState(userId);
+  const text = ctx.text.trim();
   
-  // Админ-команда: выдать запросы
-  if (state && state.action === 'admin_give' && isAdmin(ctx)) {
-    clearState(userId);
-    
-    const parts = ctx.text.trim().split(/\s+/);
-    if (parts.length !== 2) {
-      return ctx.reply(
-        '❌ Неверный формат. Используй:\n<code>ID_ПОЛЬЗОВАТЕЛЯ КОЛИЧЕСТВО</code>',
-        { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
-      );
-    }
-    
-    const targetId = parseInt(parts[0]);
-    const amount = parseInt(parts[1]);
-    
-    if (!targetId || !amount) {
-      return ctx.reply('❌ Неверные числа', { reply_markup: keyboards.admin.reply_markup });
-    }
-    
-    const target = stmts.getUser.get(targetId);
-    if (!target) {
-      return ctx.reply('❌ Пользователь не найден', { reply_markup: keyboards.admin.reply_markup });
-    }
-    
-    stmts.addRequests.run(amount, targetId);
-    
-    ctx.reply(
-      `✅ Выдано <b>${amount}</b> запросов пользователю <b>${escapeHtml(target.first_name || targetId)}</b>\n` +
-      `Новый баланс: <b>${target.requests + amount}</b>`,
-      { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
-    );
-    
-    // Уведомляем пользователя
-    ctx.telegram.sendMessage(
-      targetId,
-      `🎁 <b>Бонус от администратора!</b>\n\n` +
-      `Тебе начислено <b>${amount}</b> запросов!\n` +
-      `Новый баланс: <b>${target.requests + amount}</b>`,
-      { parse_mode: 'HTML' }
-    ).catch(() => {});
-    
-    return;
-  }
-  
-  // Обычный ввод URL
-  if (!state || state.action !== 'waiting_url') {
+  // Если нет состояния — показываем меню
+  if (!state) {
     return ctx.reply(
       'Используй кнопки ниже 👇',
       { reply_markup: keyboards.main.reply_markup }
     );
   }
   
-  clearState(userId);
-  
-  const url = ctx.text.trim();
-  
-  // Валидация URL
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+  // Шаг 1: Ожидание URL
+  if (state.step === 'waiting_url') {
+    // Проверка URL
+    let url = text;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'https://' + url;
+    }
+    
+    if (!isValidUrl(url)) {
+      return ctx.reply(
+        '❌ <b>Некорректная ссылка</b>\n\n' +
+        'Отправь valid URL:\n<code>https://example.com</code>',
+        { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
+      );
+    }
+    
+    setState(userId, { step: 'waiting_date', url: url });
+    
     return ctx.reply(
-      '❌ <b>Некорректная ссылка</b>\n\n' +
-      'Отправь полный URL:\n<code>https://example.com</code>',
-      { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+      '📅 <b>Какую дату ищем?</b>\n\n' +
+      'Отправь дату в любом формате:\n\n' +
+      '<code>2020</code> — любой день 2020\n' +
+      '<code>2020-06</code> — июнь 2020\n' +
+      '<code>2020-06-15</code> — конкретный день\n' +
+      '<code>15.06.2020</code> — тоже ок\n\n' +
+      'Или выбери быстро:',
+      { parse_mode: 'HTML', reply_markup: keyboards.search.reply_markup }
     );
   }
   
-  const user = getOrCreateUser(ctx);
-  
-  // Проверка лимита
-  if (user.requests <= 0) {
-    return ctx.reply(
-      '❌ <b>Баланс исчерпан!</b>\n\n' +
-      '📊 Купи подписку или пригласи друга:\n' +
-      '📅 Неделя — 100₽\n' +
-      '📆 Месяц — 300₽\n' +
-      '📀 Год — 1000₽\n\n' +
-      '👥 Рефералка: /start → Рефералка',
-      { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
-    );
+  // Шаг 2: Ожидание даты
+  if (state.step === 'waiting_date') {
+    clearState(userId);
+    
+    const parsed = parseUserDate(text);
+    
+    if (!parsed.valid) {
+      return ctx.reply(
+        '❌ <b>Непонятная дата</b>\n\n' +
+        'Используй формат:\n' +
+        '<code>2020</code>, <code>2020-06</code>, <code>15.06.2020</code>\n\n' +
+        'Попробуй ещё раз:',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    const url = state.url;
+    
+    // Отправляем "печатает..."
+    await ctx.replyWithChatAction('typing');
+    
+    // Поиск в архиве
+    const result = await searchArchive(url, parsed.timestamp);
+    
+    // Сохраняем в историю
+    stmts.addHistory.run(userId, url, parsed.display, result.found ? 1 : 0);
+    
+    if (result.found) {
+      const archiveDate = result.timestamp.substring(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+      
+      ctx.reply(
+        '✅ <b>Архив найден!</b>\n\n' +
+        `🔗 <b>Оригинал:</b> <a href="${url}">${escapeHtml(url)}</a>\n` +
+        `📅 <b>Дата архива:</b> ${archiveDate}\n` +
+        `🕰️ <b>Статус:</b> ${result.status === '200' ? '✅ OK' : '⚠️ ' + result.status}\n\n` +
+        `👇 <b>Смотри архив:</b>\n` +
+        `<a href="${result.url}">Открыть в Wayback Machine</a>\n\n` +
+        '<i>Нажми на ссылку выше!</i>',
+        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup, disable_web_page_preview: true }
+      );
+    } else {
+      ctx.reply(
+        '❌ <b>Архив не найден</b>\n\n' +
+        `🔗 Ссылка: <a href="${url}">${escapeHtml(url)}</a>\n` +
+        `📅 Дата: ${parsed.display}\n\n` +
+        '😕 Возможно:\n' +
+        '• Страница никогда не архивировалась\n' +
+        '• Дата слишком ранняя (сайт не существовал)\n' +
+        '• Сайт заблокирован от архивации\n\n' +
+        '💡 Попробуй другую дату или сайт!',
+        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+      );
+    }
+    
+    return;
   }
   
-  // Отправляем "печатает..."
-  await ctx.replyWithChatAction('typing');
+  // По умолчанию — меню
+  ctx.reply('Используй кнопки ниже 👇', {
+    reply_markup: keyboards.main.reply_markup
+  });
+});
+
+// Быстрые даты
+bot.action('date_today', (ctx) => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
   
-  // Архивируем
-  const result = await archivePage(url, userId);
-  
-  if (!result.success) {
-    return ctx.reply(
-      `❌ <b>Ошибка архивации</b>\n\n` +
-      `Не удалось сохранить страницу:\n<code>${escapeHtml(result.error)}</code>\n\n` +
-      'Попробуй другую ссылку.',
-      { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
-    );
+  if (!state || state.step !== 'waiting_date') {
+    return ctx.answerCbQuery('Сначала отправь ссылку!');
   }
   
-  // Списываем запрос
-  stmts.useRequest.run(userId);
+  const today = new Date();
+  const dateStr = today.toISOString().split('T')[0];
   
-  // Сохраняем в БД
-  stmts.addArchive.run(userId, url, result.title, result.filePath, result.fileSize);
-  
-  const updatedUser = stmts.getUser.get(userId);
-  
-  ctx.reply(
-    `✅ <b>Страница сохранена!</b>\n\n` +
-    `📄 <b>${escapeHtml(result.title)}</b>\n` +
-    `🔗 <a href="${url}">Открыть оригинал</a>\n` +
-    `💾 Размер: <b>${Math.round(result.fileSize / 1024)} KB</b>\n\n` +
-    `📊 Осталось запросов: <b>${updatedUser.requests}</b>`,
-    { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
+  setState(userId, { step: 'waiting_date', url: state.url });
+  ctx.editMessageText(
+    `📅 Ищем архив на <b>${dateStr}</b>...\n\n<i>Подожди секунду...</i>`,
+    { parse_mode: 'HTML' }
   );
+  
+  // Эмулируем ввод даты
+  ctx.telegram.sendMessage(userId, dateStr);
+});
+
+bot.action('date_year_ago', (ctx) => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  
+  if (!state || state.step !== 'waiting_date') {
+    return ctx.answerCbQuery('Сначала отправь ссылку!');
+  }
+  
+  const yearAgo = new Date();
+  yearAgo.setFullYear(yearAgo.getFullYear() - 1);
+  const dateStr = yearAgo.toISOString().split('T')[0];
+  
+  setState(userId, { step: 'waiting_date', url: state.url });
+  ctx.editMessageText(
+    `📅 Ищем архив на <b>${dateStr}</b> (год назад)...\n\n<i>Подожди секунду...</i>`,
+    { parse_mode: 'HTML' }
+  );
+  
+  ctx.telegram.sendMessage(userId, dateStr);
 });
 
 // ========== АДМИН-ПАНЕЛЬ ==========
-
 bot.command('admin', (ctx) => {
-  if (!isAdmin(ctx)) {
+  if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
     return ctx.reply('⛔️ Доступ запрещён');
   }
   
+  const stats = stmts.getStats.get();
+  
   ctx.reply(
     '🔐 <b>Админ-панель</b>\n\n' +
-    'Выбери действие:',
-    { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
-  );
-});
-
-bot.action('admin_stats', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  
-  const stats = stmts.getStats.get();
-  const archives = stmts.getTotalArchives.get();
-  const today = stmts.getTodayArchives.get();
-  
-  ctx.editMessageText(
-    '📊 <b>Статистика бота</b>\n\n' +
-    `👥 Пользователей: <b>${stats.total_users}</b>\n` +
-    `💰 Всего запросов на балансах: <b>${stats.total_requests}</b>\n` +
-    `💾 Всего архивов: <b>${archives.count}</b>\n` +
-    `📅 Архивов сегодня: <b>${today.count}</b>`,
-    { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
-  );
-});
-
-bot.action('admin_users', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  
-  const users = stmts.getAllUsers.all();
-  
-  if (users.length === 0) {
-    return ctx.editMessageText('Пользователей пока нет.', { reply_markup: keyboards.admin.reply_markup });
-  }
-  
-  let text = '👥 <b>Пользователи</b>\n\n';
-  users.slice(0, 20).forEach((u, i) => {
-    const name = escapeHtml(u.first_name || u.username || 'Unknown');
-    text += `${i + 1}. <b>${name}</b> (ID: <code>${u.user_id}</code>)\n`;
-    text += `   Запросов: ${u.requests} | Тариф: ${u.subscription_type}\n`;
-    text += `   Рег: ${formatDate(u.created_at)}\n\n`;
-  });
-  
-  if (users.length > 20) {
-    text += `\n... и ещё ${users.length - 20} пользователей`;
-  }
-  
-  ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup });
-});
-
-bot.action('admin_give', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  
-  const userId = ctx.from.id;
-  setState(userId, { action: 'admin_give' });
-  
-  ctx.editMessageText(
-    '🎁 <b>Выдать запросы</b>\n\n' +
-    'Отправь в формате:\n<code>ID_ПОЛЬЗОВАТЕЛЯ КОЛИЧЕСТВО</code>\n\n' +
-    'Пример: <code>123456789 10</code>',
+    `👥 Пользователей: <b>${stats.total_users || 0}</b>\n` +
+    `🔍 Поисков всего: <b>${stats.total_searches || 0}</b>`,
     { parse_mode: 'HTML' }
   );
 });
 
 // ========== ЗАПУСК ==========
-bot.launch();
+bot.launch({ dropPendingUpdates: true });
 console.log('🚀 Lumi Archive Bot запущен!');
 console.log('🤖 @' + botUsername);
 if (ADMIN_ID) console.log('🔐 Админ ID:', ADMIN_ID);
 
+// Graceful shutdown
 process.once('SIGINT', () => {
   bot.stop('SIGINT');
   db.close();
