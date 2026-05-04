@@ -104,15 +104,12 @@ async function getArchiveDates(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    // Убираем протокол и www для поиска по домену
     let cleanUrl = url.replace(/^https?:\/\//, '').replace(/^www\./, '');
-    // Берём только домен (без пути)
     try {
       const u = new URL('https://' + cleanUrl);
       cleanUrl = u.hostname;
     } catch (e) {}
 
-    // matchType=domain — ищем по всему домену
     const cdxUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(cleanUrl)}&matchType=domain&output=json&collapse=timestamp:6&limit=30&fl=timestamp,original`;
     console.log(`[CDX] ${cdxUrl}`);
     
@@ -140,14 +137,20 @@ async function getArchiveDates(url) {
     const seen = new Set();
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      const ts = row[0]; // fl=timestamp,original → ts в индексе 0
+      const ts = row[0];
+      const original = row[1];
       if (!ts || ts.length < 6) continue;
       const year = ts.substring(0, 4);
       const month = ts.substring(4, 6);
       const ym = `${year}-${month}`;
       if (!seen.has(ym)) {
         seen.add(ym);
-        dates.push({ ts: ts.substring(0, 6), display: `${year}-${month}` });
+        dates.push({ 
+          ts: ts.substring(0, 6), 
+          display: `${year}-${month}`,
+          fullTs: ts,
+          original: original
+        });
       }
     }
     console.log(`[CDX] Found ${dates.length} unique months`);
@@ -350,15 +353,18 @@ bot.action('pay_year', async (ctx) => {
 
 // ========== ВЫБОР ДАТЫ КНОПКАМИ ==========
 bot.action(/^date_(\d{4,6})$/, async (ctx) => {
-  await ctx.answerCbQuery('🕷️ Ищем архив...').catch(() => {});
+  await ctx.answerCbQuery('🕷️ Открываем архив...').catch(() => {});
   const userId = ctx.from.id;
   const state = getState(userId);
   if (!state || state.step !== 'waiting_date_selection') {
     return ctx.reply('🕸️ Сессия истекла. Начни заново.', { reply_markup: keyboards.main.reply_markup });
   }
   
-  const timestamp = ctx.match[1];
+  const ts = ctx.match[1];
   const url = state.url;
+  const dates = state.dates || [];
+  const dateInfo = dates.find(d => d.ts === ts);
+  
   const user = getOrCreateUser(ctx);
   const requestsLeft = user.requests || 0;
   
@@ -366,11 +372,29 @@ bot.action(/^date_(\d{4,6})$/, async (ctx) => {
     return ctx.reply('❌ <b>Запросы закончились!</b> 🕸️\n\n💎 Купи премиум или пригласи друга!', { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup });
   }
   
-  await ctx.replyWithChatAction('typing');
-  const result = await searchArchiveSmart(url, timestamp);
-  
   if (!user.is_premium) stmts.useRequest.run(userId);
-  stmts.addHistory.run(userId, url, timestamp, result.found ? 1 : 0);
+  
+  // Строим URL напрямую из CDX данных
+  if (dateInfo && dateInfo.fullTs && dateInfo.original) {
+    const archiveUrl = `https://web.archive.org/web/${dateInfo.fullTs}id_/${dateInfo.original}`;
+    const displayDate = dateInfo.fullTs.substring(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+    
+    stmts.addHistory.run(userId, url, displayDate, 1);
+    
+    return ctx.reply(
+      '🕷️ <b>Архив найден!</b> 🕸️\n\n' +
+      '🔗 <b>Оригинал:</b> <a href="' + url + '">' + escapeHtml(url) + '</a>\n' +
+      '📅 <b>Дата архива:</b> ' + displayDate + '\n\n' +
+      '👇 <b>Открыть архив:</b>\n' +
+      '<a href="' + archiveUrl + '">🕷️ Смотреть историческую версию</a>',
+      { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup, disable_web_page_preview: true }
+    );
+  }
+  
+  // Fallback на available API
+  await ctx.replyWithChatAction('typing');
+  const result = await searchArchiveSmart(url, ts);
+  stmts.addHistory.run(userId, url, ts, result.found ? 1 : 0);
   
   if (result.found) {
     const archiveDate = result.timestamp.substring(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
@@ -380,7 +404,7 @@ bot.action(/^date_(\d{4,6})$/, async (ctx) => {
     );
   } else {
     ctx.reply(
-      '🕸️ <b>Архив не найден</b> 🕷️\n\n🔗 Ссылка: <a href="' + url + '">' + escapeHtml(url) + '</a>\n📅 Дата: ' + timestamp + '\n\n😕 К сожалению, снапшот за эту дату недоступен.\n\n💡 Попробуй другую дату!',
+      '🕸️ <b>Архив не найден</b> 🕷️\n\n🔗 Ссылка: <a href="' + url + '">' + escapeHtml(url) + '</a>\n📅 Дата: ' + ts + '\n\n😕 К сожалению, снапшот за эту дату недоступен.\n\n💡 Попробуй другую дату!',
       { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
     );
   }
@@ -490,7 +514,7 @@ bot.on('text', async (ctx) => {
     const dates = await getArchiveDates(url);
     
     if (dates && dates.length > 0) {
-      setState(userId, { step: 'waiting_date_selection', url });
+      setState(userId, { step: 'waiting_date_selection', url, dates });
       const buttons = dates.map(d => Markup.button.callback('📅 ' + d.display, 'date_' + d.ts));
       const rows = [];
       for (let i = 0; i < buttons.length; i += 2) {
