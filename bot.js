@@ -6,8 +6,11 @@ const Database = require('better-sqlite3');
 const bot = new Telegraf(process.env.BOT_TOKEN, {
   telegram: { webhookReply: false }
 });
-const botUsername = process.env.BOT_USERNAME || 'lumi_archive';
 const ADMIN_ID = 8660224775;
+
+// Получаем реальное имя бота динамически
+let botUsername = process.env.BOT_USERNAME || '';
+if (botUsername.startsWith('@')) botUsername = botUsername.slice(1);
 
 // ========== БАЗА ДАННЫХ ==========
 const db = new Database('lumi_archive.db');
@@ -116,11 +119,13 @@ function parseUserDate(input) {
 // ========== ПОИСК В АРХИВЕ (собственная база) ==========
 async function searchArchive(url, timestamp) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), 15000); // 15 секунд
 
   try {
     const cleanUrl = url.replace(/^https?:\/\//, '');
     const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}&timestamp=${timestamp}`;
+    
+    console.log(`[SEARCH] URL: ${cleanUrl}, timestamp: ${timestamp}`);
     
     const response = await fetch(apiUrl, {
       signal: controller.signal,
@@ -131,6 +136,7 @@ async function searchArchive(url, timestamp) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
     const data = await response.json();
+    console.log(`[SEARCH] Response:`, JSON.stringify(data).substring(0, 200));
     
     if (data.archived_snapshots?.closest?.available) {
       const snap = data.archived_snapshots.closest;
@@ -144,6 +150,7 @@ async function searchArchive(url, timestamp) {
     return { found: false };
   } catch (error) {
     clearTimeout(timeout);
+    console.error(`[SEARCH ERROR] ${error.name}: ${error.message}`);
     if (error.name === 'AbortError') return { found: false, error: 'timeout' };
     return { found: false, error: error.message };
   }
@@ -459,163 +466,6 @@ bot.action('pay_year', async (ctx) => {
   }
 });
 
-bot.action('pay_month', (ctx) => {
-  ctx.editMessageText(
-    '💎 <b>Месяц — 5 USDT</b> 🕸️\n\n' +
-    'Для оплаты через @CryptoBot:\n\n' +
-    '1. Открой @CryptoBot\n' +
-    '2. Отправь 5 USDT на адрес админа\n' +
-    '3. Пришли скриншот сюда\n\n' +
-    '🕷️ Или напиши: @lumi_support',
-    { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
-  );
-});
-
-bot.action('pay_year', (ctx) => {
-  ctx.editMessageText(
-    '💎 <b>Год — 15 USDT</b> 🕷️\n\n' +
-    'Для оплаты через @CryptoBot:\n\n' +
-    '1. Открой @CryptoBot\n' +
-    '2. Отправь 15 USDT на адрес админа\n' +
-    '3. Пришли скриншот сюда\n\n' +
-    '🕸️ Или напиши: @lumi_support',
-    { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
-  );
-});
-
-// Обработка текста
-bot.on('text', async (ctx) => {
-  const userId = ctx.from.id;
-  const state = getState(userId);
-  const text = ctx.text.trim();
-  
-  // Админ: выдать запросы
-  if (state?.action === 'admin_give' && isAdmin(ctx)) {
-    clearState(userId);
-    const parts = text.split(/\s+/);
-    if (parts.length !== 2) {
-      return ctx.reply('❌ Формат: <code>ID КОЛИЧЕСТВО</code>', { parse_mode: 'HTML' });
-    }
-    const targetId = parseInt(parts[0]);
-    const amount = parseInt(parts[1]);
-    if (!targetId || !amount) return ctx.reply('❌ Неверные числа');
-    
-    const target = stmts.getUser.get(targetId);
-    if (!target) return ctx.reply('❌ Пользователь не найден');
-    
-    stmts.addRequests.run(amount, targetId);
-    ctx.reply(`✅ Выдано <b>${amount}</b> запросов`, { parse_mode: 'HTML' });
-    ctx.telegram.sendMessage(targetId, `🕸️ <b>Бонус!</b>\n\nТебе начислено <b>${amount}</b> запросов!`, { parse_mode: 'HTML' }).catch(() => {});
-    return;
-  }
-  
-  if (!state) {
-    return ctx.reply('🕷️ Используй кнопки ниже 👇', { reply_markup: keyboards.main.reply_markup });
-  }
-  
-  if (state.step === 'waiting_url') {
-    let url = text;
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      url = 'https://' + url;
-    }
-    
-    if (!isValidUrl(url)) {
-      return ctx.reply(
-        '❌ <b>Некорректная ссылка</b>\n\n' +
-        'Отправь valid URL:\n<code>https://example.com</code>',
-        { parse_mode: 'HTML', reply_markup: keyboards.back.reply_markup }
-      );
-    }
-    
-    setState(userId, { step: 'waiting_date', url });
-    
-    return ctx.reply(
-      '🕷️ <b>Ссылка принята!</b> 🕸️\n\n' +
-      '📅 <b>Какую дату ищем?</b>\n\n' +
-      'Отправь дату в любом формате:\n\n' +
-      '<code>2020</code> — любой день 2020\n' +
-      '<code>2020-06</code> — июнь 2020\n' +
-      '<code>2020-06-15</code> — конкретный день\n' +
-      '<code>15.06.2020</code> — тоже ок',
-      { parse_mode: 'HTML' }
-    );
-  }
-  
-  if (state.step === 'waiting_date') {
-    clearState(userId);
-    
-    const parsed = parseUserDate(text);
-    if (!parsed.valid) {
-      return ctx.reply(
-        '❌ <b>Непонятная дата</b>\n\n' +
-        'Используй формат:\n' +
-        '<code>2020</code>, <code>2020-06</code>, <code>15.06.2020</code>\n\n' +
-        'Попробуй ещё раз:',
-        { parse_mode: 'HTML' }
-      );
-    }
-    
-    const url = state.url;
-    const user = getOrCreateUser(ctx);
-    
-    if (user.requests <= 0 && !user.is_premium) {
-      return ctx.reply(
-        '❌ <b>Запросы закончились!</b> 🕸️\n\n' +
-        '💎 Купи премиум или пригласи друга:\n' +
-        '🕷️ Неделя — 2 USDT\n' +
-        '🕸️ Месяц — 5 USDT\n' +
-        '🕷️ Год — 15 USDT\n\n' +
-        '👥 Рефералка: +5 запросов за друга',
-        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
-      );
-    }
-    
-    await ctx.replyWithChatAction('typing');
-    
-    const result = await searchArchive(url, parsed.ts);
-    
-    if (!user.is_premium) {
-      stmts.useRequest.run(userId);
-    }
-    stmts.addHistory.run(userId, url, parsed.display, result.found ? 1 : 0);
-    
-    if (result.found) {
-      const archiveDate = result.timestamp.substring(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
-      
-      ctx.reply(
-        '🕷️ <b>Архив найден!</b> 🕸️\n\n' +
-        `🔗 <b>Оригинал:</b> <a href="${url}">${escapeHtml(url)}</a>\n` +
-        `📅 <b>Дата архива:</b> ${archiveDate}\n` +
-        `🕸️ <b>Статус:</b> ${result.status === '200' ? '✅ Сохранён' : '⚠️ ' + result.status}\n\n` +
-        `👇 <b>Открыть архив:</b>\n` +
-        `<a href="${result.url}">🕷️ Смотреть историческую версию</a>\n\n` +
-        '<i>Нажми на ссылку выше!</i>',
-        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup, disable_web_page_preview: true }
-      );
-    } else {
-      const reason = result.error === 'timeout' 
-        ? '⏱️ Запрос занял слишком много времени. Попробуй ещё раз или выбери другую дату.'
-        : '😕 Страница не найдена в нашем архиве.\n\n' +
-          'Возможно:\n' +
-          '• Сайт никогда не архивировался\n' +
-          '• Дата слишком ранняя\n' +
-          '• Сайт заблокирован от сохранения';
-      
-      ctx.reply(
-        '🕸️ <b>Архив не найден</b> 🕷️\n\n' +
-        `🔗 Ссылка: <a href="${url}">${escapeHtml(url)}</a>\n` +
-        `📅 Дата: ${parsed.display}\n\n` +
-        reason + '\n\n' +
-        '💡 Попробуй другую дату или сайт!',
-        { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
-      );
-    }
-    return;
-  }
-  
-  ctx.reply('🕷️ Используй кнопки ниже 👇', { reply_markup: keyboards.main.reply_markup });
-});
-
 // ========== АДМИН-ПАНЕЛЬ ==========
 bot.command('admin', (ctx) => {
   if (!isAdmin(ctx)) {
@@ -673,10 +523,22 @@ bot.action('admin_give', (ctx) => {
 });
 
 // ========== ЗАПУСК ==========
+async function startBot() {
+  try {
+    const me = await bot.telegram.getMe();
+    botUsername = me.username;
+    console.log('🕷️ Lumi Archive Bot запущен!');
+    console.log('🕸️ @' + botUsername);
+    console.log('🔐 Админ ID:', ADMIN_ID);
+  } catch (e) {
+    console.error('❌ Не удалось получить info бота:', e.message);
+    console.log('🕷️ Lumi Archive Bot запущен!');
+    console.log('🕸️ @' + botUsername);
+  }
+}
+
 bot.launch({ dropPendingUpdates: true });
-console.log('🕷️ Lumi Archive Bot запущен!');
-console.log('🕸️ @' + botUsername);
-console.log('🔐 Админ ID:', ADMIN_ID);
+startBot();
 
 process.once('SIGINT', () => {
   bot.stop('SIGINT');
