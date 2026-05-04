@@ -642,47 +642,73 @@ bot.command('admin', (ctx) => {
   );
 });
 
-bot.action('admin_stats', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const stats = stmts.getStats.get();
-  ctx.editMessageText(
-    '🕸️ <b>Статистика</b> 🕷️\n\n' +
-    `👥 Пользователей: <b>${stats.total_users || 0}</b>\n` +
-    `💰 Запросов в системе: <b>${stats.total_requests || 0}</b>`,
-    { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
-  );
-});
-
-bot.action('admin_users', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const users = stmts.getAllUsers.all();
-  
-  if (users.length === 0) {
-    return ctx.editMessageText('🕸️ Пользователей пока нет.', { reply_markup: keyboards.admin.reply_markup });
+bot.action('admin_stats', async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery('⛔️ Доступ запрещён').catch(() => {});
   }
-  
-  let text = '🕸️ <b>Пользователи</b> 🕷️\n\n';
-  users.slice(0, 15).forEach((u, i) => {
-    const name = escapeHtml(u.first_name || u.username || 'Unknown');
-    text += `${i + 1}. <b>${name}</b> (ID: <code>${u.user_id}</code>)\n`;
-    text += `   🕷️ ${u.requests} запросов | 👥 ${u.referrals} реф | 💎 ${u.is_premium ? 'Да' : 'Нет'}\n`;
-    text += `   🕐 ${formatDate(u.created_at)}\n\n`;
-  });
-  
-  if (users.length > 15) text += `\n... и ещё ${users.length - 15}`;
-  
-  ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup });
+  try {
+    const stats = stmts.getStats.get();
+    await ctx.editMessageText(
+      '🕸️ <b>Статистика</b> 🕷️\n\n' +
+      `👥 Пользователей: <b>${stats.total_users || 0}</b>\n` +
+      `💰 Запросов в системе: <b>${stats.total_requests || 0}</b>`,
+      { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup }
+    );
+  } catch (e) {
+    ctx.reply('🕸️ <b>Статистика</b> 🕷️\n\nОшибка загрузки').catch(() => {});
+  }
 });
 
-bot.action('admin_give', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  setState(ctx.from.id, { action: 'admin_give' });
-  ctx.editMessageText(
-    '🎁 <b>Выдать запросы</b> 🕸️\n\n' +
-    'Отправь:\n<code>ID_ПОЛЬЗОВАТЕЛЯ КОЛИЧЕСТВО</code>\n\n' +
-    'Пример: <code>123456789 10</code>',
-    { parse_mode: 'HTML' }
-  );
+bot.action('admin_users', async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery('⛔️ Доступ запрещён').catch(() => {});
+  }
+  try {
+    const users = stmts.getAllUsers.all();
+    
+    if (users.length === 0) {
+      return ctx.editMessageText('🕸️ Пользователей пока нет.', { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup });
+    }
+    
+    let text = '🕸️ <b>Пользователи</b> 🕷️\n\n';
+    users.slice(0, 15).forEach((u, i) => {
+      const name = escapeHtml(u.first_name || u.username || 'Unknown');
+      text += `${i + 1}. <b>${name}</b> (ID: <code>${u.user_id}</code>)\n`;
+      text += `   🕷️ ${u.requests || 0} запросов | 👥 ${u.referrals || 0} реф | 💎 ${u.is_premium ? 'Да' : 'Нет'}\n`;
+      text += `   🕐 ${formatDate(u.created_at)}\n\n`;
+    });
+    
+    if (users.length > 15) text += `\n... и ещё ${users.length - 15}`;
+    
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboards.admin.reply_markup });
+  } catch (e) {
+    ctx.reply('🕸️ Ошибка загрузки пользователей').catch(() => {});
+  }
+});
+
+bot.action('admin_give', async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery('⛔️ Доступ запрещён').catch(() => {});
+  }
+  try {
+    setState(ctx.from.id, { action: 'admin_give' });
+    await ctx.editMessageText(
+      '🎁 <b>Выдать запросы</b> 🕸️\n\n' +
+      'Отправь:\n<code>ID_ПОЛЬЗОВАТЕЛЯ КОЛИЧЕСТВО</code>\n\n' +
+      'Пример: <code>123456789 10</code>',
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) {
+    ctx.reply('🎁 Отправь: ID КОЛИЧЕСТВО').catch(() => {});
+  }
+});
+
+// ========== ЗАЩИТА ОТ ПАДЕНИЙ ==========
+bot.catch((err, ctx) => {
+  console.error(`[ERROR] ${ctx.updateType}:`, err.message);
+  try {
+    ctx.reply('🕸️ Упс, что-то пошло не так... Попробуй ещё раз!').catch(() => {});
+  } catch (e) {}
 });
 
 // ========== ЗАПУСК ==========
