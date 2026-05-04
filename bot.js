@@ -122,58 +122,79 @@ function parseUserDate(input) {
   return { valid: false };
 }
 
-// ========== ПОИСК В АРХИВЕ (собственная база) ==========
-async function searchArchive(url, timestamp) {
+// ========== УМНЫЙ ПОИСК С FALLBACK ==========
+async function searchArchiveSmart(url, timestamp) {
+  const variants = [];
+  
+  // Вариант 1: оригинальный URL
+  variants.push({ url: url.replace(/^https?:\/\//, ''), ts: timestamp });
+  
+  // Вариант 2: без www
+  if (url.includes('www.')) {
+    variants.push({ url: url.replace(/^https?:\/\//, '').replace('www.', ''), ts: timestamp });
+  }
+  
+  // Вариант 3: только домен (без пути)
+  try {
+    const u = new URL(url);
+    if (u.pathname !== '/' && u.pathname !== '') {
+      variants.push({ url: u.hostname, ts: timestamp });
+    }
+  } catch (e) {}
+  
+  // Вариант 4: без timestamp (ближайший)
+  variants.push({ url: url.replace(/^https?:\/\//, ''), ts: null });
+  
+  for (const v of variants) {
+    const result = await searchArchiveSingle(v.url, v.ts);
+    if (result.found) {
+      console.log(`[SMART SEARCH] ✅ Found with variant: ${v.url} ts=${v.ts}`);
+      return result;
+    }
+  }
+  
+  return { found: false };
+}
+
+async function searchArchiveSingle(cleanUrl, timestamp) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000); // 20 сек
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
-    const cleanUrl = url.replace(/^https?:\/\//, '');
-    const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}&timestamp=${timestamp}`;
+    let apiUrl;
+    if (timestamp) {
+      apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}&timestamp=${timestamp}`;
+    } else {
+      apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}`;
+    }
     
-    console.log(`[SEARCH] === START ===`);
-    console.log(`[SEARCH] URL: ${cleanUrl}`);
-    console.log(`[SEARCH] Timestamp: ${timestamp}`);
-    console.log(`[SEARCH] Full API: ${apiUrl}`);
+    console.log(`[SEARCH] URL: ${cleanUrl}, ts: ${timestamp || 'any'}`);
     
     const response = await fetch(apiUrl, {
       signal: controller.signal,
-      headers: {
+      headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
       }
     });
     clearTimeout(timeout);
     
-    console.log(`[SEARCH] HTTP Status: ${response.status}`);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
     const data = await response.json();
-    console.log(`[SEARCH] FULL Response:`, JSON.stringify(data, null, 2));
-    
-    // ДЕБАГ: показываем пользователю что API вернул
-    const debugInfo = `🧪 <b>Debug API:</b>\nStatus: ${response.status}\nURL: ${cleanUrl}\nTS: ${timestamp}\nSnapshots: ${JSON.stringify(data.archived_snapshots || {}).substring(0, 200)}`;
     
     if (data.archived_snapshots?.closest?.available) {
       const snap = data.archived_snapshots.closest;
-      console.log(`[SEARCH] ✅ FOUND: ${snap.url}`);
       return {
         found: true,
         url: snap.url.replace('http://', 'https://'),
         timestamp: snap.timestamp,
-        status: snap.status,
-        debug: debugInfo
+        status: snap.status
       };
     }
-    console.log(`[SEARCH] ❌ NOT FOUND — archived_snapshots empty`);
-    return { found: false, debug: debugInfo, raw: JSON.stringify(data).substring(0, 400) };
+    return { found: false };
   } catch (error) {
     clearTimeout(timeout);
-    console.error(`[SEARCH ERROR] ${error.name}: ${error.message}`);
-    console.error(`[SEARCH ERROR] Stack:`, error.stack);
     if (error.name === 'AbortError') return { found: false, error: 'timeout' };
     return { found: false, error: error.message };
   }
@@ -665,7 +686,7 @@ bot.on('text', async (ctx) => {
     
     await ctx.replyWithChatAction('typing');
     
-    const result = await searchArchive(url, parsed.ts);
+    const result = await searchArchiveSmart(url, parsed.ts);
     
     if (!user.is_premium) {
       stmts.useRequest.run(userId);
@@ -682,7 +703,7 @@ bot.on('text', async (ctx) => {
         `🕸️ <b>Статус:</b> ${result.status === '200' ? '✅ Сохранён' : '⚠️ ' + result.status}\n\n` +
         `👇 <b>Открыть архив:</b>\n` +
         `<a href="${result.url}">🕷️ Смотреть историческую версию</a>\n\n` +
-        `<i>${result.debug || ''}</i>`,
+        '<i>Нажми на ссылку выше!</i>',
         { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup, disable_web_page_preview: true }
       );
     } else {
@@ -699,8 +720,6 @@ bot.on('text', async (ctx) => {
         `🔗 Ссылка: <a href="${url}">${escapeHtml(url)}</a>\n` +
         `📅 Дата: ${parsed.display}\n\n` +
         reason + '\n\n' +
-        `🧪 <b>Debug:</b>\n<code>${result.debug || 'no debug'}</code>\n\n` +
-        `🧪 <b>Raw:</b>\n<code>${result.raw || 'no raw'}</code>\n\n` +
         '💡 Попробуй другую дату или сайт!',
         { parse_mode: 'HTML', reply_markup: keyboards.main.reply_markup }
       );
