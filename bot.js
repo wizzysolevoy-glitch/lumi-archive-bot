@@ -104,22 +104,43 @@ async function getArchiveDates(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    const cleanUrl = url.replace(/^https?:\/\//, '');
-    const cdxUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(cleanUrl)}&output=json&collapse=timestamp:6&limit=24`;
+    // Убираем протокол и www для поиска по домену
+    let cleanUrl = url.replace(/^https?:\/\//, '').replace(/^www\./, '');
+    // Берём только домен (без пути)
+    try {
+      const u = new URL('https://' + cleanUrl);
+      cleanUrl = u.hostname;
+    } catch (e) {}
+
+    // matchType=domain — ищем по всему домену
+    const cdxUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(cleanUrl)}&matchType=domain&output=json&collapse=timestamp:6&limit=30&fl=timestamp,original`;
     console.log(`[CDX] ${cdxUrl}`);
+    
     const res = await fetch(cdxUrl, {
       signal: controller.signal,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
     clearTimeout(timeout);
-    if (!res.ok) return null;
+    
+    console.log(`[CDX] Status: ${res.status}`);
+    if (!res.ok) {
+      console.log(`[CDX] HTTP error: ${res.status}`);
+      return null;
+    }
+    
     const data = await res.json();
-    if (!Array.isArray(data) || data.length < 2) return null;
+    console.log(`[CDX] Rows: ${data.length}`);
+    
+    if (!Array.isArray(data) || data.length < 2) {
+      console.log(`[CDX] Empty or invalid response`);
+      return null;
+    }
+    
     const dates = [];
     const seen = new Set();
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      const ts = row[1];
+      const ts = row[0]; // fl=timestamp,original → ts в индексе 0
       if (!ts || ts.length < 6) continue;
       const year = ts.substring(0, 4);
       const month = ts.substring(4, 6);
@@ -129,6 +150,7 @@ async function getArchiveDates(url) {
         dates.push({ ts: ts.substring(0, 6), display: `${year}-${month}` });
       }
     }
+    console.log(`[CDX] Found ${dates.length} unique months`);
     return dates.slice(0, 20);
   } catch (e) {
     clearTimeout(timeout);
@@ -327,7 +349,7 @@ bot.action('pay_year', async (ctx) => {
 });
 
 // ========== ВЫБОР ДАТЫ КНОПКАМИ ==========
-bot.action(/^date_(\d{6})$/, async (ctx) => {
+bot.action(/^date_(\d{4,6})$/, async (ctx) => {
   await ctx.answerCbQuery('🕷️ Ищем архив...').catch(() => {});
   const userId = ctx.from.id;
   const state = getState(userId);
@@ -481,10 +503,19 @@ bot.on('text', async (ctx) => {
         { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(rows).reply_markup }
       );
     } else {
-      setState(userId, { step: 'waiting_date_manual', url });
+      // Fallback: популярные годы кнопками
+      setState(userId, { step: 'waiting_date_selection', url });
+      const fallbackYears = ['2024', '2023', '2022', '2021', '2020', '2019', '2018', '2017', '2016', '2015', '2014', '2013', '2012', '2011', '2010'];
+      const buttons = fallbackYears.map(y => Markup.button.callback('📅 ' + y, 'date_' + y));
+      const rows = [];
+      for (let i = 0; i < buttons.length; i += 3) {
+        rows.push(buttons.slice(i, i + 3));
+      }
+      rows.push([Markup.button.callback('🕷️ Любая дата', 'date_any'), Markup.button.callback('🕸️ Назад', 'main_menu')]);
+      
       return ctx.reply(
-        '🕷️ <b>Не удалось получить список дат</b> 🕸️\n\nВведи дату вручную:\n<code>2020</code> — любой день 2020\n<code>2020-06</code> — июнь 2020\n<code>2020-06-15</code> — конкретный день',
-        { parse_mode: 'HTML' }
+        '🕷️ <b>Выбери год для поиска:</b>\n<code>' + escapeHtml(url) + '</code>\n\n<i>(Не удалось загрузить точные даты, показываю популярные годы)</i>',
+        { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(rows).reply_markup }
       );
     }
   }
